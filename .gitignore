@@ -1,0 +1,5 @@
+.DS_Store
+
+# Editor state — the whole repo ships to anyone who installs the plugin.
+.idea/
+.vscode/
