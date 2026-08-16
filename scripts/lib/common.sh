@@ -3,9 +3,27 @@
 # See skills/ticket-workspace/SKILL.md for the setup this assumes.
 
 # Config precedence: environment > config file > defaults.
+#
+# The config file uses `export`, so sourcing it OVERWRITES whatever the caller
+# set in the environment -- the exact opposite of the precedence documented
+# everywhere, including in the file's own header. The environment values are
+# therefore captured first and reinstated afterwards, which is what makes
+# `BRANCH_PREFIX=fix/ new-ticket …` or pointing at a second fleet for one
+# command actually work.
 FLEET_CONFIG_DIR="${FLEET_CONFIG_DIR:-${HOME}/.config/repo-fleet}"
+_env_FLEET_ROOT="${FLEET_ROOT:-}"
+_env_TICKETS_ROOT="${TICKETS_ROOT:-}"
+_env_BRANCH_PREFIX="${BRANCH_PREFIX:-}"
+_env_BRANCH_TEMPLATE="${BRANCH_TEMPLATE:-}"
+
 # shellcheck disable=SC1091
 [[ -f "$FLEET_CONFIG_DIR/fleet.env" ]] && source "$FLEET_CONFIG_DIR/fleet.env"
+
+[[ -n "$_env_FLEET_ROOT" ]]      && FLEET_ROOT="$_env_FLEET_ROOT"
+[[ -n "$_env_TICKETS_ROOT" ]]    && TICKETS_ROOT="$_env_TICKETS_ROOT"
+[[ -n "$_env_BRANCH_PREFIX" ]]   && BRANCH_PREFIX="$_env_BRANCH_PREFIX"
+[[ -n "$_env_BRANCH_TEMPLATE" ]] && BRANCH_TEMPLATE="$_env_BRANCH_TEMPLATE"
+unset _env_FLEET_ROOT _env_TICKETS_ROOT _env_BRANCH_PREFIX _env_BRANCH_TEMPLATE
 
 FLEET_ROOT="${FLEET_ROOT:-${HOME}/code/fleet}"
 TICKETS_ROOT="${TICKETS_ROOT:-${HOME}/tickets}"

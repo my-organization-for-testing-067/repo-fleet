@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+# Regression test for the fleet and ticket-workspace scripts.
+#
+# These scripts delete worktrees and branches, so their guards are the whole
+# product: refusing to discard uncommitted work, refusing to drop commits that
+# are not merged, validating every repo name before creating anything. A guard
+# nobody tests is a guard that quietly stops working, and the failure mode here
+# is lost work rather than a wrong answer.
+#
+# It builds its own fleet of tiny git repos -- real ones, with bare origins, so
+# worktrees, origin/HEAD detection and "not in origin/main" behave as they do in
+# production -- and drives the real scripts against it. Nothing touches your
+# config: FLEET_CONFIG_DIR, FLEET_ROOT and TICKETS_ROOT are all redirected into
+# a temporary directory, which is precisely why FLEET_CONFIG_DIR exists.
+#
+# Usage: verify-workspace [--keep]
+set -uo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+keep=0
+[[ "${1:-}" == "--keep" ]] && keep=1
+
+# Deliberately NOT sourcing lib/common.sh: this has to observe the scripts from
+# outside, and inheriting their config resolution would hide a bug in it.
+if [[ -t 2 ]]; then
+  R=$'\033[31m'; G=$'\033[32m'; Y=$'\033[33m'; B=$'\033[1m'; O=$'\033[0m'
+else R=''; G=''; Y=''; B=''; O=''; fi
+say()  { printf '%s\n' "$*" >&2; }
+pass=0; fail=0; failed=()
+ok()   { printf '%s✓%s %s\n' "$G" "$O" "$*" >&2; pass=$((pass+1)); }
+bad()  { printf '%s✗%s %s\n' "$R" "$O" "$*" >&2; fail=$((fail+1)); failed+=("$1"); }
+note() { printf '%s!%s %s\n' "$Y" "$O" "$*" >&2; }
+
+root=$(mktemp -d)
+export FLEET_CONFIG_DIR="$root/config"
+export FLEET_ROOT="$root/fleet"
+export TICKETS_ROOT="$root/tickets"
+unset BRANCH_PREFIX BRANCH_TEMPLATE
+
+cleanup() { [[ $keep -eq 1 ]] && { say "kept: $root"; return; }; rm -rf "$root"; }
+trap cleanup EXIT
+
+git_q() { git -c user.email=v@e.example -c user.name=Verify "$@"; }
+
+# A fleet repo: bare origin plus a working clone, so origin/main and
+# origin/HEAD are real rather than simulated.
+mk_repo() {
+  local name="$1"
+  local origin="$root/origins/$name.git"
+  local tmp
+  mkdir -p "$root/origins"
+  git init -q --bare --initial-branch=main "$origin"
+  tmp=$(mktemp -d)
+  git init -q --initial-branch=main "$tmp"
+  printf 'name: %s\n' "$name" > "$tmp/README.md"
+  mkdir -p "$tmp/src"; printf 'const ROUTE = "/api/v1/%s";\n' "$name" > "$tmp/src/app.js"
+  git_q -C "$tmp" add -A; git_q -C "$tmp" commit -q -m "Import $name"
+  git_q -C "$tmp" remote add origin "$origin"; git_q -C "$tmp" push -q origin main
+  rm -rf "$tmp"
+  git clone -q "$origin" "$FLEET_ROOT/$name"
+  git -C "$FLEET_ROOT/$name" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+}
+
+mkdir -p "$FLEET_ROOT"
+for r in alpha-api beta-service gamma-web; do mk_repo "$r"; done
+say "${B}fleet:${O} $root/fleet (3 repos)"
+say ""
+
+# ---- fleet-init ------------------------------------------------------------
+say "${B}fleet-init${O}"
+
+"$here/fleet-init" --config --fleet-root "$FLEET_ROOT" --tickets-root "$TICKETS_ROOT" >/dev/null 2>&1
+if [[ -f "$FLEET_CONFIG_DIR/fleet.env" ]]; then ok "--config writes the config file"
+else bad "config-written"; fi
+
+if [[ -f "$FLEET_CONFIG_DIR/hooks/post-create.sample" ]]; then
+  ok "--config scaffolds a hook sample"
+else bad "hook-sample"; fi
+
+# An overwrite that is not asked for is data loss: someone's roots and template.
+"$here/fleet-init" --config --fleet-root /elsewhere >/dev/null 2>&1
+if [[ $? -ne 0 ]] && grep -q "$FLEET_ROOT" "$FLEET_CONFIG_DIR/fleet.env"; then
+  ok "--config refuses to clobber without --force, config intact"
+else bad "config-clobber"; fi
+
+"$here/fleet-init" --config --force --fleet-root "$root/same" --tickets-root "$root/same" >/dev/null 2>&1
+[[ $? -ne 0 ]] && ok "--config rejects identical fleet and tickets roots" || bad "config-same-roots"
+
+# --clone is how repos are added later, so "already present" must be a no-op
+# rather than a re-clone that would blow away local state.
+out=$("$here/fleet-init" --clone "$root/origins/alpha-api.git" 2>&1)
+if printf '%s' "$out" | grep -q 'already in the fleet'; then
+  ok "--clone skips a repo already in the fleet"
+else bad "clone-idempotent"; fi
+
+out=$("$here/fleet-init" --status 2>&1)
+if printf '%s' "$out" | grep -q 'alpha-api' && printf '%s' "$out" | grep -q 'beta-service'; then
+  ok "--status lists the cloned repos"
+else bad "status-lists"; fi
+
+# The config file uses `export`, so sourcing it will happily overwrite the
+# caller's environment unless that is guarded -- and it did. Getting this
+# backwards points every command at the wrong fleet while looking correct.
+out=$(FLEET_ROOT="$root/elsewhere" "$here/fleet-init" --status 2>&1)
+if printf '%s' "$out" | grep -q "$root/elsewhere"; then
+  ok "environment overrides the config file"
+else bad "env-precedence"; fi
+
+# ---- new-ticket ------------------------------------------------------------
+say ""
+say "${B}new-ticket${O}"
+
+"$here/new-ticket" TEST-1 alpha-api beta-service >/dev/null 2>&1
+if [[ -d "$TICKETS_ROOT/TEST-1/alpha-api" && -d "$TICKETS_ROOT/TEST-1/beta-service" ]]; then
+  ok "creates a worktree per repo"
+else bad "worktrees-created"; fi
+
+b=$(git -C "$TICKETS_ROOT/TEST-1/alpha-api" branch --show-current 2>/dev/null)
+[[ "$b" == "feature/TEST-1" ]] && ok "branches as feature/<ticket>" || bad "branch-name ($b)"
+
+# The whole point of validating first: a typo must not leave a half-built
+# workspace that the user then has to reason about.
+"$here/new-ticket" TEST-TYPO alpha-api no-such-repo >/dev/null 2>&1
+if [[ ! -d "$TICKETS_ROOT/TEST-TYPO/alpha-api" ]]; then
+  ok "a bad repo name creates nothing at all"
+else bad "validate-before-create"; fi
+
+# Resuming is the common case -- adding a repo to a ticket already in progress.
+marker="$TICKETS_ROOT/TEST-1/alpha-api/.resume-marker"
+touch "$marker"
+out=$("$here/new-ticket" TEST-1 alpha-api gamma-web 2>&1)
+if [[ -f "$marker" && -d "$TICKETS_ROOT/TEST-1/gamma-web" ]]; then
+  ok "re-running resumes: existing repo untouched, new one added"
+else bad "resume"; fi
+
+# ---- branch naming ---------------------------------------------------------
+say ""
+say "${B}branch naming${O}"
+
+BRANCH_TEMPLATE='users/zvi/{ticket}' "$here/new-ticket" TEST-TPL alpha-api >/dev/null 2>&1
+b=$(git -C "$TICKETS_ROOT/TEST-TPL/alpha-api" branch --show-current 2>/dev/null)
+[[ "$b" == "users/zvi/TEST-TPL" ]] && ok "BRANCH_TEMPLATE overrides the prefix" \
+  || bad "branch-template (got '$b')"
+BRANCH_TEMPLATE='users/zvi/{ticket}' "$here/close-ticket" TEST-TPL --force >/dev/null 2>&1
+
+BRANCH_PREFIX='fix/' "$here/new-ticket" TEST-PFX alpha-api >/dev/null 2>&1
+b=$(git -C "$TICKETS_ROOT/TEST-PFX/alpha-api" branch --show-current 2>/dev/null)
+[[ "$b" == "fix/TEST-PFX" ]] && ok "BRANCH_PREFIX is honoured" || bad "branch-prefix (got '$b')"
+BRANCH_PREFIX='fix/' "$here/close-ticket" TEST-PFX --force >/dev/null 2>&1
+
+# ---- hooks -----------------------------------------------------------------
+say ""
+say "${B}hooks${O}"
+
+mkdir -p "$FLEET_CONFIG_DIR/hooks"
+cat > "$FLEET_CONFIG_DIR/hooks/post-create" <<'H'
+#!/usr/bin/env bash
+printf '%s %s\n' "$FLEET_REPO" "$FLEET_BRANCH" > "$FLEET_WORKTREE/.hook-global"
+H
+chmod +x "$FLEET_CONFIG_DIR/hooks/post-create"
+
+# Committed to the repo: reaches every engineer, and arrives via the worktree.
+wt=$(mktemp -d); git clone -q "$root/origins/beta-service.git" "$wt/beta"
+mkdir -p "$wt/beta/.fleet"
+printf '#!/usr/bin/env bash\ntouch "$FLEET_WORKTREE/.hook-committed"\n' > "$wt/beta/.fleet/post-create"
+chmod +x "$wt/beta/.fleet/post-create"
+git_q -C "$wt/beta" add -A; git_q -C "$wt/beta" commit -q -m "Add post-create hook"
+git_q -C "$wt/beta" push -q origin main; rm -rf "$wt"
+git -C "$FLEET_ROOT/beta-service" fetch -q origin
+git -C "$FLEET_ROOT/beta-service" reset -q --hard origin/main
+
+# Untracked in the fleet clone: yours alone, for a repo you cannot commit to.
+mkdir -p "$FLEET_ROOT/gamma-web/.fleet"
+printf '#!/usr/bin/env bash\ntouch "$FLEET_WORKTREE/.hook-local"\n' > "$FLEET_ROOT/gamma-web/.fleet/post-create"
+chmod +x "$FLEET_ROOT/gamma-web/.fleet/post-create"
+
+# Fails, and must not take the workspace down with it.
+mkdir -p "$FLEET_ROOT/alpha-api/.fleet"
+printf '#!/usr/bin/env bash\nexit 7\n' > "$FLEET_ROOT/alpha-api/.fleet/post-create"
+chmod +x "$FLEET_ROOT/alpha-api/.fleet/post-create"
+
+out=$("$here/new-ticket" TEST-HOOK alpha-api beta-service gamma-web 2>&1); rc=$?
+
+[[ -f "$TICKETS_ROOT/TEST-HOOK/beta-service/.hook-global" ]] \
+  && ok "global hook runs for every repo" || bad "hook-global"
+[[ -f "$TICKETS_ROOT/TEST-HOOK/beta-service/.hook-committed" ]] \
+  && ok "repo hook committed to the repo runs" || bad "hook-committed"
+[[ -f "$TICKETS_ROOT/TEST-HOOK/gamma-web/.hook-local" ]] \
+  && ok "repo hook untracked in the fleet clone runs" || bad "hook-local"
+
+# The environment a hook is handed is part of the contract.
+if grep -q 'alpha-api feature/TEST-HOOK' "$TICKETS_ROOT/TEST-HOOK/alpha-api/.hook-global" 2>/dev/null; then
+  ok "hooks receive FLEET_REPO and FLEET_BRANCH"
+else bad "hook-env"; fi
+
+if printf '%s' "$out" | grep -q 'FAILED with exit 7'; then
+  ok "a failing hook reports its exit code"
+else bad "hook-failure-reported"; fi
+
+if [[ -d "$TICKETS_ROOT/TEST-HOOK/alpha-api" && $rc -eq 0 ]]; then
+  ok "a failing hook does not abort workspace creation"
+else bad "hook-failure-nonfatal"; fi
+
+# Silence here would be the worst outcome: setup that never ran, unreported.
+"$here/close-ticket" TEST-HOOK --force >/dev/null 2>&1
+chmod -x "$FLEET_ROOT/gamma-web/.fleet/post-create"
+out=$("$here/new-ticket" TEST-NOEXEC gamma-web 2>&1)
+if printf '%s' "$out" | grep -q 'not executable'; then
+  ok "a non-executable hook is reported, not skipped silently"
+else bad "hook-nonexecutable"; fi
+"$here/close-ticket" TEST-NOEXEC --force >/dev/null 2>&1
+rm -rf "$FLEET_ROOT"/*/.fleet "$FLEET_CONFIG_DIR/hooks/post-create"
+
+# ---- close-ticket guards ---------------------------------------------------
+# The part that can lose work, so each refusal is asserted with its exit code.
+say ""
+say "${B}close-ticket guards${O}"
+
+echo "edited" >> "$TICKETS_ROOT/TEST-1/alpha-api/src/app.js"
+out=$("$here/close-ticket" TEST-1 2>&1); rc=$?
+if [[ $rc -ne 0 ]] && printf '%s' "$out" | grep -q 'tracked files'; then
+  ok "refuses on uncommitted tracked edits, exits non-zero"
+else bad "guard-uncommitted (rc=$rc)"; fi
+[[ -d "$TICKETS_ROOT/TEST-1/alpha-api" ]] && ok "the blocked worktree still exists" \
+  || bad "guard-uncommitted-kept"
+
+# Untracked-only is usually hook output, and needs a different fix, so the
+# message has to distinguish it.
+git -C "$TICKETS_ROOT/TEST-1/alpha-api" checkout -q -- src/app.js
+touch "$TICKETS_ROOT/TEST-1/alpha-api/leftover.tmp"
+out=$("$here/close-ticket" TEST-1 2>&1)
+if printf '%s' "$out" | grep -q 'untracked file'; then
+  ok "untracked-only is reported differently from tracked edits"
+else bad "guard-untracked-message"; fi
+rm -f "$TICKETS_ROOT/TEST-1/alpha-api/leftover.tmp" "$marker"
+
+# Commits not in origin/main are the case where --force really destroys work.
+git_q -C "$TICKETS_ROOT/TEST-1/alpha-api" commit -q --allow-empty -m "TEST-1: work in progress"
+out=$("$here/close-ticket" TEST-1 2>&1); rc=$?
+if [[ $rc -ne 0 ]] && printf '%s' "$out" | grep -q 'not in origin/main'; then
+  ok "refuses to drop commits not in origin/main, exits non-zero"
+else bad "guard-unmerged (rc=$rc)"; fi
+
+"$here/close-ticket" TEST-1 --force --keep-branches >/dev/null 2>&1
+if [[ ! -d "$TICKETS_ROOT/TEST-1/alpha-api" ]] \
+   && git -C "$FLEET_ROOT/alpha-api" show-ref --verify --quiet refs/heads/feature/TEST-1; then
+  ok "--keep-branches removes the worktree but keeps the branch"
+else bad "keep-branches"; fi
+
+git -C "$FLEET_ROOT/alpha-api" branch -q -D feature/TEST-1 >/dev/null 2>&1
+"$here/new-ticket" TEST-2 alpha-api beta-service >/dev/null 2>&1
+"$here/close-ticket" TEST-2 --force >/dev/null 2>&1
+leftover=0
+[[ -d "$TICKETS_ROOT/TEST-2" ]] && leftover=1
+for r in alpha-api beta-service; do
+  [[ -n "$(git -C "$FLEET_ROOT/$r" worktree list | tail -n +2)" ]] && leftover=1
+  git -C "$FLEET_ROOT/$r" show-ref --verify --quiet refs/heads/feature/TEST-2 && leftover=1
+done
+[[ $leftover -eq 0 ]] && ok "--force leaves no worktree, branch, or directory behind" \
+  || bad "force-cleanup"
+
+# ---- refresh-fleet ---------------------------------------------------------
+say ""
+say "${B}refresh-fleet${O}"
+
+tmp=$(mktemp -d); git clone -q "$root/origins/alpha-api.git" "$tmp/a"
+printf 'upstream change\n' >> "$tmp/a/README.md"
+git_q -C "$tmp/a" commit -q -am "Upstream moves"; git_q -C "$tmp/a" push -q origin main
+rm -rf "$tmp"
+
+"$here/refresh-fleet" >/dev/null 2>&1
+if git -C "$FLEET_ROOT/alpha-api" log -1 --pretty=%s | grep -q 'Upstream moves'; then
+  ok "pulls a fleet repo up to origin"
+else bad "refresh-updates"; fi
+
+# A dirty fleet repo means someone worked in the fleet, which the model forbids.
+# Resetting it silently would destroy that work.
+echo "local edit" >> "$FLEET_ROOT/beta-service/README.md"
+out=$("$here/refresh-fleet" 2>&1)
+if printf '%s' "$out" | grep -q 'local changes' \
+   && grep -q 'local edit' "$FLEET_ROOT/beta-service/README.md"; then
+  ok "skips a fleet repo with local changes rather than resetting it"
+else bad "refresh-skips-dirty"; fi
+
+"$here/refresh-fleet" --force >/dev/null 2>&1
+grep -q 'local edit' "$FLEET_ROOT/beta-service/README.md" \
+  && bad "refresh-force" || ok "--force discards local changes"
+
+# A worktree on another branch must survive the daily reset, or the fleet
+# refresh would eat in-progress tickets.
+"$here/new-ticket" TEST-3 gamma-web >/dev/null 2>&1
+git_q -C "$TICKETS_ROOT/TEST-3/gamma-web" commit -q --allow-empty -m "TEST-3: in progress"
+"$here/refresh-fleet" >/dev/null 2>&1
+if git -C "$TICKETS_ROOT/TEST-3/gamma-web" log -1 --pretty=%s 2>/dev/null | grep -q 'TEST-3'; then
+  ok "a ticket worktree survives a fleet refresh"
+else bad "refresh-preserves-worktree"; fi
+"$here/close-ticket" TEST-3 --force >/dev/null 2>&1
+
+# ---- summary ---------------------------------------------------------------
+say ""
+say "${B}$pass passed, $fail failed${O}"
+for f in "${failed[@]:-}"; do [[ -n "$f" ]] && say "  $f"; done
+[[ $fail -eq 0 ]]

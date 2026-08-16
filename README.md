@@ -79,6 +79,21 @@ covered in [GETTING-STARTED.md](GETTING-STARTED.md):
 and live ticket workspaces — including hooks that exist but are not executable,
 the usual reason one silently does nothing.
 
+## Verifying
+
+```sh
+scripts/verify-workspace          # 30 checks against a throwaway fleet
+```
+
+It builds its own fleet of small git repos with real bare origins, then drives
+the real scripts against it — so `origin/HEAD` detection, worktrees, and "not in
+origin/main" behave as they do in production. Nothing touches your config:
+`FLEET_CONFIG_DIR`, `FLEET_ROOT` and `TICKETS_ROOT` are redirected into a
+temporary directory, which is why `FLEET_CONFIG_DIR` is overridable at all.
+
+The guards below are the reason it exists. They are the part that can lose
+work, and a guard nobody tests is one that quietly stops working.
+
 ## Safety properties
 
 - `new-ticket` validates every repo name **before creating anything**, so a typo
@@ -92,3 +107,5 @@ the usual reason one silently does nothing.
   model forbids.
 - A failing `post-create` hook warns and continues: a workspace that exists but
   is not fully provisioned beats no workspace.
+- Environment variables override `fleet.env`, so a one-off
+  `BRANCH_PREFIX=hotfix/ new-ticket …` or a second fleet for one command works.
