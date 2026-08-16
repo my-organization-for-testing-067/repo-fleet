@@ -1,0 +1,31 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "repo-fleet",
+  "description": "An opinionated environment for working across many repositories: a fleet of repos, per-ticket worktree workspaces, and search that understands both levels",
+  "owner": {
+    "name": "Zvi Rahamim"
+  },
+  "plugins": [
+    {
+      "name": "fleet-workspace",
+      "description": "Work on a ticket that spans several repositories: clone a fleet of repos once, then create a per-ticket workspace of git worktrees holding only the repos that ticket changes.",
+      "version": "1.1.0",
+      "author": { "name": "Zvi Rahamim" },
+      "category": "productivity",
+      "source": "./",
+      "homepage": "https://github.com/my-organization-for-testing-067/repo-fleet"
+    },
+    {
+      "name": "code-search",
+      "description": "Search across many repositories at once — who calls an endpoint, where a symbol is defined, what implements an interface, which repo publishes a package, and when a cross-repo seam last changed. Routes each question to whichever of five engines can answer it, and labels every answer with the kind of evidence behind it.",
+      "version": "1.0.0",
+      "author": { "name": "Zvi Rahamim" },
+      "category": "productivity",
+      "source": {
+        "source": "url",
+        "url": "https://github.com/my-organization-for-testing-067/code-search-fleet.git"
+      },
+      "homepage": "https://github.com/my-organization-for-testing-067/code-search-fleet"
+    }
+  ]
+}
