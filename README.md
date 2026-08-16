@@ -109,3 +109,13 @@ work, and a guard nobody tests is one that quietly stops working.
   is not fully provisioned beats no workspace.
 - Environment variables override `fleet.env`, so a one-off
   `BRANCH_PREFIX=hotfix/ new-ticket …` or a second fleet for one command works.
+
+## License
+
+[Apache-2.0](LICENSE). Chosen over MIT for the explicit patent grant, which is
+what makes a corporate legal review a formality rather than a conversation —
+a fleet of repos side by side is an organisation's layout, not an individual's,
+so the install instructions invite exactly the audience that has to ask. Without
+a LICENSE file the default is all rights reserved, which blocks not just use but
+vendoring, internal mirroring, and redistribution through an internal plugin
+marketplace.
